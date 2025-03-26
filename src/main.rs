@@ -1,9 +1,12 @@
 use std::fs; // For reading files
 use log::{info, error};
+use std::env;
 
 fn main() {
     env_logger::init();
-    let rom_path = "pokemon_red.gb";
+    let rom_path: Vec<String> = env::args().collect();
+    let rom_path = &rom_path[1]; // Filename for ROM (.gb file)
+    println!("ROM PATH: {}", rom_path);
 
     println!("Starting gameboy emulator...");
 
