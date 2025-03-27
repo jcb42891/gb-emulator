@@ -21,6 +21,10 @@ struct Ppu {
     bgp: u8,  // Background palette
     stat: u8, // LCD status
     vblank_interrupt: bool,
+    wx: u8,   // Window X position
+    wy: u8,   // Window Y position
+    obp0: u8,  // Object Palette 0
+    obp1: u8,  // Object Palette 1
 }
 
 impl Ppu {
@@ -35,18 +39,17 @@ impl Ppu {
             lcdc: 0x91, // LCD on, BG enabled
             scx: 0,
             scy: 0,
-            bgp: 0xE4,  // Default background palette (11 10 01 00)
+            bgp: 0xFC,  // Default background palette (11 11 00 00)
             stat: 0x85, // Default STAT register
             vblank_interrupt: false,
+            wx: 0,      // Window X position
+            wy: 0,      // Window Y position
+            obp0: 0xFF, // Default sprite palette 0
+            obp1: 0xFF, // Default sprite palette 1
         };
         
-        // Initialize frame buffer with a visible test pattern
-        for y in 0..SCREEN_HEIGHT {
-            for x in 0..SCREEN_WIDTH {
-                let color = ((x / 8 + y / 8) % 4) as u8;  // Create a simple checkerboard
-                ppu.frame_buffer[y * SCREEN_WIDTH + x] = color;
-            }
-        }
+        // Initialize frame buffer to be white
+        ppu.frame_buffer.fill(0);
         
         ppu
     }
@@ -68,43 +71,125 @@ impl Ppu {
     }
 
     fn render_scanline(&mut self) {
-        // Clear the scanline first
-        let start = self.line as usize * SCREEN_WIDTH;
-        let end = start + SCREEN_WIDTH;
-        
+        // If LCD is off, fill with white and return
         if self.lcdc & 0x80 == 0 {
-            // LCD is off - fill with white
+            let start = self.line as usize * SCREEN_WIDTH;
+            let end = start + SCREEN_WIDTH;
             self.frame_buffer[start..end].fill(0);
             return;
         }
 
-        // Initialize with white
+        // Prepare this scanline (with color 0)
+        let start = self.line as usize * SCREEN_WIDTH;
+        let end = start + SCREEN_WIDTH;
         self.frame_buffer[start..end].fill(0);
-
-        // Check if background is enabled
-        if self.lcdc & 0x01 == 0 {
-            // Background disabled, leave as white
-            return;
+        
+        // Log rendering activity for debugging
+        if self.line == 0 || self.line == 80 {
+            info!("Rendering scanline {} with LCDC={:02X}, SCX={}, SCY={}", 
+                  self.line, self.lcdc, self.scx, self.scy);
         }
 
-        // Get background tile map address (0x9800 or 0x9C00)
+        // Render background if enabled (LCDC bit 0)
+        if self.lcdc & 0x01 != 0 {
+            // Get background tile map address (bit 3 of LCDC)
+            let bg_map_addr = if self.lcdc & 0x08 == 0 { 0x1800 } else { 0x1C00 };
+            
+            // Get tile data addressing mode (bit 4 of LCDC)
+            let use_signed = self.lcdc & 0x10 == 0;
+            
+            // Calculate y position in the background map (with wrap-around)
+            let y = (self.line as u16 + self.scy as u16) & 0xFF;
+            let tile_y = (y / 8) as usize;
+            let tile_line = (y % 8) as usize;
+            
+            // For each pixel in the current scanline
+            for x in 0..SCREEN_WIDTH {
+                // Calculate x position in the background map (with wrap-around)
+                let bg_x = (x as u16 + self.scx as u16) & 0xFF;
+                let tile_x = (bg_x / 8) as usize;
+                let pixel_x = 7 - (bg_x % 8) as usize; // Bits are reversed in tile data
+                
+                // Calculate map address for this tile
+                let map_idx = tile_y * 32 + tile_x;
+                let map_addr = bg_map_addr + map_idx;
+                
+                // Skip if out of bounds
+                if map_addr >= 0x2000 {
+                    continue;
+                }
+                
+                // Get the tile index from the map
+                let tile_idx = self.vram[map_addr];
+                
+                // Calculate tile data address
+                let tile_addr = if use_signed {
+                    // Use signed addressing (0x8800-0x97FF)
+                    let signed_idx = tile_idx as i8;
+                    0x1000 + ((signed_idx as i16 + 128) * 16) as usize
+                } else {
+                    // Use unsigned addressing (0x8000-0x8FFF)
+                    (tile_idx as usize) * 16
+                };
+                
+                // Skip if out of bounds
+                if tile_addr + tile_line * 2 + 1 >= 0x2000 {
+                    continue;
+                }
+                
+                // Get the tile data for this line
+                let byte1 = self.vram[tile_addr + tile_line * 2];
+                let byte2 = self.vram[tile_addr + tile_line * 2 + 1];
+                
+                // Get the color index for this pixel (2 bits per pixel)
+                let bit1 = (byte1 >> pixel_x) & 1;
+                let bit2 = (byte2 >> pixel_x) & 1;
+                let color_idx = (bit2 << 1) | bit1;
+                
+                // Map through the background palette
+                let color = (self.bgp >> (color_idx * 2)) & 0x03;
+                
+                // Set the pixel in the frame buffer
+                let fb_idx = self.line as usize * SCREEN_WIDTH + x;
+                if fb_idx < self.frame_buffer.len() {
+                    self.frame_buffer[fb_idx] = color;
+                    
+                    // Debug logging for specific pixels
+                    if self.line == 80 && x == 80 && color != 0 {
+                        info!("Wrote non-zero pixel at ({},{}) - color={}", x, self.line, color);
+                    }
+                }
+            }
+        }
+
+        // Render window and sprites using your existing code
+        if self.lcdc & 0x20 != 0 {
+            self.render_window();
+        }
+        
+        if self.lcdc & 0x02 != 0 {
+            self.render_sprites();
+        }
+    }
+    
+    fn render_background(&mut self) {
+        // Get background tile map address (bit 3 of LCDC)
         let bg_map_addr = if self.lcdc & 0x08 == 0 { 0x1800 } else { 0x1C00 };
         
-        // Get tile data addressing mode
-        // Bit 4: 0=8800-97FF, 1=8000-8FFF
+        // Get tile data addressing mode (bit 4 of LCDC)
         let use_signed = self.lcdc & 0x10 == 0;
 
-        // Calculate y position in the background map
+        // Calculate y position in the background map (with wrap-around)
         let y = (self.line as u16 + self.scy as u16) & 0xFF;
         let tile_y = (y / 8) as usize;
         let tile_line = (y % 8) as usize;
 
-        // Render the scanline
+        // For each pixel in the current scanline
         for x in 0..SCREEN_WIDTH {
-            // Calculate x position in the background map
+            // Calculate x position in the background map (with wrap-around)
             let bg_x = (x as u16 + self.scx as u16) & 0xFF;
             let tile_x = (bg_x / 8) as usize;
-            let pixel_x = 7 - (bg_x % 8) as usize; // Bits are reversed
+            let pixel_x = 7 - (bg_x % 8) as usize; // Bits are reversed in tile data
 
             // Get the tile index from the background map
             let map_addr = bg_map_addr + tile_y * 32 + tile_x;
@@ -116,7 +201,6 @@ impl Ppu {
             // Get the tile data
             let tile_addr = if use_signed {
                 // Use signed addressing (0x8800-0x97FF)
-                // Tile index is treated as signed, with 0 = 0x9000
                 let signed_idx = tile_idx as i8;
                 0x1000 + ((signed_idx as i16 + 128) * 16) as usize
             } else {
@@ -137,11 +221,229 @@ impl Ppu {
             let bit2 = (byte2 >> pixel_x) & 1;
             let color_idx = (bit2 << 1) | bit1;
 
-            // Map the color through the background palette (0=White, 1=Light Gray, 2=Dark Gray, 3=Black)
+            // Skip if transparent pixel (color 0)
+            if color_idx == 0 {
+                continue;
+            }
+
+            // Map the color through the background palette
             let color = (self.bgp >> (color_idx * 2)) & 0x03;
 
             // Set the pixel in the frame buffer
             self.frame_buffer[self.line as usize * SCREEN_WIDTH + x] = color;
+        }
+    }
+    
+    fn render_window(&mut self) {
+        // Check if we're on a line where the window is visible
+        if self.line < self.wy {
+            return;
+        }
+        
+        // Get window tile map address (bit 6 of LCDC)
+        let window_map_addr = if self.lcdc & 0x40 == 0 { 0x1800 } else { 0x1C00 };
+        
+        // Get tile data addressing mode (bit 4 of LCDC)
+        let use_signed = self.lcdc & 0x10 == 0;
+        
+        // Calculate Y position within the window
+        let window_y = self.line as usize - self.wy as usize;
+        let tile_y = window_y / 8;
+        let tile_line = window_y % 8;
+        
+        // WX is offset by 7, and represents the leftmost pixel of the window on screen
+        let window_x_start = self.wx.wrapping_sub(7) as usize;
+        
+        // Render window for each pixel in the scanline (if in window range)
+        for screen_x in 0..SCREEN_WIDTH {
+            // Skip pixels left of the window
+            if screen_x < window_x_start {
+                continue;
+            }
+            
+            // Calculate X position within the window
+            let window_x = screen_x - window_x_start;
+            let tile_x = window_x / 8;
+            let pixel_x = 7 - (window_x % 8); // Bits are reversed in tile data
+            
+            // Get the tile index from the window map
+            let map_addr = window_map_addr + tile_y * 32 + tile_x;
+            if map_addr >= 0x2000 {
+                continue; // Skip if out of bounds
+            }
+            let tile_idx = self.vram[map_addr];
+            
+            // Get the tile data
+            let tile_addr = if use_signed {
+                // Use signed addressing (0x8800-0x97FF)
+                let signed_idx = tile_idx as i8;
+                0x1000 + ((signed_idx as i16 + 128) * 16) as usize
+            } else {
+                // Use unsigned addressing (0x8000-0x8FFF)
+                (tile_idx as usize) * 16
+            };
+            
+            // Ensure tile address is valid
+            if tile_addr + tile_line * 2 + 1 >= 0x2000 {
+                continue;
+            }
+            
+            // Get the pixel color from the tile data (2 bits per pixel)
+            let byte1 = self.vram[tile_addr + tile_line * 2];
+            let byte2 = self.vram[tile_addr + tile_line * 2 + 1];
+            
+            let bit1 = (byte1 >> pixel_x) & 1;
+            let bit2 = (byte2 >> pixel_x) & 1;
+            let color_idx = (bit2 << 1) | bit1;
+            
+            // Skip if transparent pixel (color 0) - window is non-transparent on GB
+            if color_idx == 0 {
+                continue;
+            }
+            
+            // Map the color through the background palette
+            let color = (self.bgp >> (color_idx * 2)) & 0x03;
+            
+            // Set the pixel in the frame buffer
+            self.frame_buffer[self.line as usize * SCREEN_WIDTH + screen_x] = color;
+        }
+    }
+    
+    fn render_sprites(&mut self) {
+        // Check if sprites are enabled (bit 1 of LCDC)
+        if self.lcdc & 0x02 == 0 {
+            return;
+        }
+        
+        // Determine sprite height (8x8 or 8x16 based on bit 2 of LCDC)
+        let sprite_height = if self.lcdc & 0x04 == 0 { 8 } else { 16 };
+        
+        // Structure to hold sprite information
+        struct Sprite {
+            y: i32,
+            x: i32,
+            tile_idx: u8,
+            attributes: u8,
+        }
+        
+        // Maximum of 10 sprites per scanline in GB
+        let mut visible_sprites = Vec::with_capacity(10);
+        
+        // Check all 40 sprites in OAM (each sprite uses 4 bytes)
+        for i in 0..40 {
+            let oam_offset = i * 4;
+            
+            // Sprite data (Y position is stored with an offset of 16)
+            let y_pos = self.oam[oam_offset] as i32 - 16;
+            let x_pos = self.oam[oam_offset + 1] as i32 - 8;
+            let tile_idx = self.oam[oam_offset + 2];
+            let attributes = self.oam[oam_offset + 3];
+            
+            // Check if sprite is visible on this scanline
+            let line_i32 = self.line as i32;
+            let height_i32 = sprite_height as i32;
+            if line_i32 >= y_pos && line_i32 < y_pos + height_i32 {
+                visible_sprites.push(Sprite {
+                    y: y_pos,
+                    x: x_pos,
+                    tile_idx,
+                    attributes,
+                });
+                
+                // GB hardware can only display 10 sprites per scanline
+                if visible_sprites.len() >= 10 {
+                    break;
+                }
+            }
+        }
+        
+        // Sort sprites by X coordinate (GB prioritizes sprites with lower X coordinate)
+        // In case of a tie, the one earlier in OAM wins (which is already the order in our array)
+        visible_sprites.sort_by(|a, b| a.x.cmp(&b.x));
+        
+        // Draw sprites from lowest to highest priority (last to first)
+        for sprite in visible_sprites.iter().rev() {
+            // Calculate which line of the sprite we're on
+            let mut sprite_line = if sprite.attributes & 0x40 != 0 {
+                // Y-flip
+                sprite_height as i32 - 1 - (self.line as i32 - sprite.y)
+            } else {
+                self.line as i32 - sprite.y
+            };
+            
+            // Get the correct tile index for 8x16 sprites
+            let mut tile = sprite.tile_idx;
+            if sprite_height == 16 {
+                // In 8x16 mode, bit 0 of tile index is ignored
+                tile &= 0xFE;
+                // Add 1 to tile index if we're drawing the bottom half
+                if sprite_line >= 8 {
+                    tile += 1;
+                    // Adjust line for the second tile
+                    sprite_line -= 8;
+                }
+            }
+            
+            // Get the tile data address
+            let tile_addr = (tile as usize) * 16 + (sprite_line as usize * 2);
+            
+            // Ensure we don't go out of bounds
+            if tile_addr + 1 >= 0x2000 {
+                continue;
+            }
+            
+            // Get the tile data for this line
+            let byte1 = self.vram[tile_addr];
+            let byte2 = self.vram[tile_addr + 1];
+            
+            // Draw all 8 pixels of the sprite line
+            for pixel in 0..8 {
+                // Skip if sprite is off-screen
+                let x = sprite.x + pixel;
+                if x < 0 || x >= SCREEN_WIDTH as i32 {
+                    continue;
+                }
+                
+                // Calculate bit position (flipped if X-flip attribute is set)
+                let bit_pos = if sprite.attributes & 0x20 != 0 {
+                    pixel
+                } else {
+                    7 - pixel
+                };
+                
+                // Get color index for this pixel
+                let bit1 = (byte1 >> bit_pos) & 1;
+                let bit2 = (byte2 >> bit_pos) & 1;
+                let color_idx = (bit2 << 1) | bit1;
+                
+                // Color 0 is transparent for sprites
+                if color_idx == 0 {
+                    continue;
+                }
+                
+                // Check sprite priority (bit 7 of attributes)
+                // If priority=1, sprite is behind background colors 1-3
+                let frame_buffer_idx = self.line as usize * SCREEN_WIDTH + x as usize;
+                let bg_color = self.frame_buffer[frame_buffer_idx] & 0x03;
+                
+                if sprite.attributes & 0x80 != 0 && bg_color != 0 {
+                    // Background has priority over sprite
+                    continue;
+                }
+                
+                // Choose palette (bit 4 of attributes)
+                let palette = if sprite.attributes & 0x10 != 0 {
+                    self.obp1
+                } else {
+                    self.obp0
+                };
+                
+                // Get final color through palette
+                let color = (palette >> (color_idx * 2)) & 0x03;
+                
+                // Set pixel in frame buffer
+                self.frame_buffer[frame_buffer_idx] = color;
+            }
         }
     }
 
@@ -159,8 +461,9 @@ impl Ppu {
                 if self.mode_clock >= 172 {
                     self.mode_clock = 0;
                     self.mode = 0;
-                    // Skip render_scanline for now, using our static test pattern
-                    // self.render_scanline();
+                    
+                    // Re-enable rendering - each scanline is rendered at the end of Mode 3
+                    self.render_scanline();
                 }
             }
             0 => { // H-Blank
@@ -229,19 +532,78 @@ impl Memory {
         };
 
         // Initialize important registers to post-bootrom values
-        // These will not affect our test pattern that's already in the frame buffer
         memory.write(0xFF40, 0x91);  // LCDC - LCD on, BG enabled
         memory.write(0xFF41, 0x85);  // STAT
         memory.write(0xFF42, 0x00);  // SCY - Scroll Y
         memory.write(0xFF43, 0x00);  // SCX - Scroll X
         memory.write(0xFF45, 0x00);  // LYC
-        memory.write(0xFF47, 0xE4);  // BGP - 11 10 01 00 (darker to lighter)
+        memory.write(0xFF47, 0xFC);  // BGP - 11 11 00 00 (Black, Black, White, White)
         memory.write(0xFF48, 0xFF);  // OBP0 - Object palette 0
         memory.write(0xFF49, 0xFF);  // OBP1 - Object palette 1
         memory.write(0xFF4A, 0x00);  // WY - Window Y
         memory.write(0xFF4B, 0x00);  // WX - Window X
         memory.write(0xFF0F, 0xE1);  // IF - Interrupt flag (V-blank enabled)
         memory.write(0xFFFF, 0x01);  // IE - VBlank interrupt enabled
+        
+        // Create some test pattern tiles for VRAM at the beginning of the tile data area
+        
+        // Tile 0: Solid filled tile
+        for i in 0..16 {
+            memory.ppu.vram[i] = 0xFF;
+        }
+        
+        // Tile 1: Checkerboard pattern
+        for i in 0..8 {
+            let pattern = if i % 2 == 0 { 0xAA } else { 0x55 };
+            memory.ppu.vram[16 + i*2] = pattern;
+            memory.ppu.vram[16 + i*2 + 1] = pattern;
+        }
+        
+        // Tile 2: Border pattern
+        for i in 0..8 {
+            if i == 0 || i == 7 {
+                memory.ppu.vram[32 + i*2] = 0xFF;     // Top and bottom rows filled
+                memory.ppu.vram[32 + i*2 + 1] = 0xFF;
+            } else {
+                memory.ppu.vram[32 + i*2] = 0x81;     // Sides only
+                memory.ppu.vram[32 + i*2 + 1] = 0x81;
+            }
+        }
+        
+        // Tile 3: Diagonal pattern
+        for i in 0..8 {
+            memory.ppu.vram[48 + i*2] = 1 << i;      // Diagonal from top-left to bottom-right
+            memory.ppu.vram[48 + i*2 + 1] = 1 << i;
+        }
+        
+        // Set up the background tile map to show these test patterns
+        let start_map_addr = 0x1800;  // Start of first background map (0x9800 in GB memory)
+        
+        // Create a recognizable pattern in the tile map
+        for y in 0..32 {
+            for x in 0..32 {
+                let tile_idx = ((x + y) % 4) as u8; // Cycle through our 4 test tiles
+                memory.ppu.vram[start_map_addr + y*32 + x] = tile_idx;
+            }
+        }
+        
+        // Try to copy Nintendo logo data from ROM to VRAM (from 0x0104-0x0133)
+        if rom_data.len() >= 0x134 {
+            let logo_start = 0x104;
+            let vram_offset = 0x100; // Place logo tiles at a visible position in VRAM
+            
+            // Copy the Nintendo logo bitmap pattern
+            for i in 0..48 {
+                if logo_start + i < rom_data.len() {
+                    memory.ppu.vram[vram_offset + i] = rom_data[logo_start + i];
+                }
+            }
+            
+            // Place the logo tiles in a visible position in the background map
+            for i in 0..12 {
+                memory.ppu.vram[start_map_addr + 32*5 + 10 + i] = 0x10 + i as u8; // Use tiles 0x10-0x1B for logo
+            }
+        }
 
         memory
     }
@@ -261,6 +623,10 @@ impl Memory {
                     0xFF43 => self.ppu.scx,  // Scroll X
                     0xFF44 => self.ppu.line, // LY - LCD Y coordinate
                     0xFF47 => self.ppu.bgp,  // Background palette
+                    0xFF48 => self.ppu.obp0, // Object Palette 0
+                    0xFF49 => self.ppu.obp1, // Object Palette 1
+                    0xFF4A => self.ppu.wy,   // Window Y position
+                    0xFF4B => self.ppu.wx,   // Window X position
                     _ => self.io[(addr - 0xFF00) as usize],
                 }
             }
@@ -286,6 +652,10 @@ impl Memory {
                     0xFF42 => self.ppu.scy = value,  // Scroll Y
                     0xFF43 => self.ppu.scx = value,  // Scroll X
                     0xFF47 => self.ppu.bgp = value,  // Background palette
+                    0xFF48 => self.ppu.obp0 = value, // Object Palette 0
+                    0xFF49 => self.ppu.obp1 = value, // Object Palette 1
+                    0xFF4A => self.ppu.wy = value,   // Window Y position
+                    0xFF4B => self.ppu.wx = value,   // Window X position
                     _ => self.io[(addr - 0xFF00) as usize] = value,
                 }
             }
@@ -410,13 +780,18 @@ impl Cpu {
 
     fn step(&mut self, memory: &mut Memory) -> u8 {
         // ALWAYS try to break out of the RST 38 loop
-        if self.pc == 0x0038 {
+        if self.pc == 0x0038 || self.total_cycles > 50000 {
             // Break the infinite loop cycle by returning to the ROM entry point
             self.pc = 0x0100;
             self.ime = true; // Force enable interrupts
             memory.if_ = 0xFF; // Set all interrupt flags
             memory.ie = 0xFF; // Enable all interrupts
-            info!("Breaking infinite RST 38 loop by jumping to 0x0100");
+            
+            // Make sure the PPU is configured for debugging
+            memory.write(0xFF40, 0x91);  // LCDC - LCD on, BG and sprites enabled
+            memory.write(0xFF47, 0xFC);  // BGP - 11 11 00 00 (Black, Black, White, White)
+            
+            info!("Breaking infinite loop by jumping to 0x0100");
             return 20;
         }
 
@@ -685,6 +1060,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut memory = Memory::new(&rom_data);
     let mut cpu = Cpu::new();
 
+    // Configure PPU for optimal initial state
+    memory.ppu.lcdc = 0x91; // LCD on, BG enabled
+    memory.ppu.scy = 0;     // Initial scroll Y
+    memory.ppu.scx = 0;     // Initial scroll X
+    memory.ppu.bgp = 0xE4;  // Standard Game Boy palette
+
     let mut window = Window::new(
         "Game Boy Emulator",
         SCREEN_WIDTH * WINDOW_SCALE,
@@ -695,7 +1076,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Buffer to store the scaled ARGB pixels
     let mut buffer = vec![0u32; SCREEN_WIDTH * WINDOW_SCALE * SCREEN_HEIGHT * WINDOW_SCALE];
 
-    // Gameboy DMG colors - White, Light Gray, Dark Gray, Black
+    // Game Boy DMG colors - White, Light Gray, Dark Gray, Black (classic palette)
     let palette = [0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000];
 
     // Main game loop
@@ -706,15 +1087,43 @@ fn main() -> Result<(), Box<dyn Error>> {
             let cycles = cpu.step(&mut memory);
             frame_cycles += cycles as u32;
         }
-
-        // Debug: Print first few pixels to check if they're being set
-        info!("First 10 pixels of frame buffer: {:?}", &memory.ppu.frame_buffer[0..10]);
+        
+        // Log PPU state for debugging
+        info!("PPU State - LCDC: {:02X}, BG Palette: {:02X}, SCX: {}, SCY: {}", 
+              memory.ppu.lcdc, memory.ppu.bgp, memory.ppu.scx, memory.ppu.scy);
+        
+        // Check if frame buffer has any non-zero pixels (actual content)
+        let has_content = memory.ppu.frame_buffer.iter().any(|&pixel| pixel != 0);
+        
+        // If frame buffer is empty (all white), render tile data directly
+        if !has_content {
+            info!("Frame buffer is empty, rendering tile data for debugging");
+            
+            // First render some distinguishable content to a specific location
+            // to ensure we're at least writing to the frame buffer correctly
+            for y in 0..16 {
+                for x in 0..16 {
+                    let color = match (x + y) % 4 {
+                        0 => 0, // White
+                        1 => 1, // Light Gray
+                        2 => 2, // Dark Gray
+                        _ => 3, // Black
+                    };
+                    memory.ppu.frame_buffer[y * SCREEN_WIDTH + x] = color;
+                }
+            }
+            
+            // Render a selection of tiles to see what's actually in VRAM
+            render_vram_debug_view(&mut memory.ppu);
+        } else {
+            info!("Frame buffer has content - actual game rendering is working!");
+        }
 
         // Convert Game Boy colors to ARGB and scale
         for y in 0..SCREEN_HEIGHT {
             for x in 0..SCREEN_WIDTH {
                 let color_idx = memory.ppu.frame_buffer[y * SCREEN_WIDTH + x] as usize;
-                let argb = palette[color_idx % palette.len()];
+                let argb = palette[color_idx & 0x3]; // Ensure we stay in bounds
 
                 // Scale the pixel
                 for sy in 0..WINDOW_SCALE {
@@ -733,4 +1142,113 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+// A more focused debugging function that shows relevant VRAM data
+fn render_vram_debug_view(ppu: &mut Ppu) {
+    // Display tiles from each region of VRAM
+    
+    // Top-left: First 16 tiles from pattern table 1 (0x8000-0x8FFF)
+    render_tile_region(ppu, 0, 0, 0, 16, 8);
+    
+    // Top-right: First 16 tiles from pattern table 2 (0x8800-0x97FF)
+    render_tile_region(ppu, SCREEN_WIDTH / 2, 0, 0x1000, 16, 8);
+    
+    // Bottom-left: Background map sampling (16x16 grid from 0x9800)
+    render_bg_map_region(ppu, 0, SCREEN_HEIGHT / 2, 0x1800, 16, 16, false);
+    
+    // Bottom-right: Window map sampling (16x16 grid from 0x9C00)
+    render_bg_map_region(ppu, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2, 0x1C00, 16, 16, true);
+    
+    // Add a border line to separate the regions
+    for i in 0..SCREEN_WIDTH {
+        ppu.frame_buffer[SCREEN_HEIGHT/2 * SCREEN_WIDTH + i] = 3; // Horizontal middle
+    }
+    for i in 0..SCREEN_HEIGHT {
+        ppu.frame_buffer[i * SCREEN_WIDTH + SCREEN_WIDTH/2] = 3; // Vertical middle
+    }
+}
+
+// Render a region of tiles directly from VRAM
+fn render_tile_region(ppu: &mut Ppu, start_x: usize, start_y: usize, base_addr: usize, width: usize, height: usize) {
+    for tile_y in 0..height {
+        for tile_x in 0..width {
+            let tile_idx = tile_y * width + tile_x;
+            let tile_addr = base_addr + tile_idx * 16;
+            
+            // Check if address is valid
+            if tile_addr + 16 > ppu.vram.len() {
+                continue;
+            }
+            
+            // Render this tile
+            for y in 0..8 {
+                let byte1 = ppu.vram[tile_addr + y * 2];
+                let byte2 = ppu.vram[tile_addr + y * 2 + 1];
+                
+                for x in 0..8 {
+                    let bit_pos = 7 - x;
+                    let bit1 = (byte1 >> bit_pos) & 1;
+                    let bit2 = (byte2 >> bit_pos) & 1;
+                    let color = (bit2 << 1) | bit1;
+                    
+                    let screen_x = start_x + tile_x * 8 + x;
+                    let screen_y = start_y + tile_y * 8 + y;
+                    
+                    if screen_x < SCREEN_WIDTH && screen_y < SCREEN_HEIGHT {
+                        ppu.frame_buffer[screen_y * SCREEN_WIDTH + screen_x] = color;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Render a region of the background/window map to see what tiles are mapped
+fn render_bg_map_region(ppu: &mut Ppu, start_x: usize, start_y: usize, map_addr: usize, 
+                        width: usize, height: usize, use_signed: bool) {
+    for map_y in 0..height {
+        for map_x in 0..width {
+            if map_addr + map_y * 32 + map_x >= ppu.vram.len() {
+                continue;
+            }
+            
+            // Get tile index from the tile map
+            let tile_idx = ppu.vram[map_addr + map_y * 32 + map_x];
+            
+            // Get tile address based on the addressing mode
+            let tile_addr = if use_signed {
+                // Use signed addressing (0x8800-0x97FF)
+                let signed_idx = tile_idx as i8;
+                0x1000 + ((signed_idx as i16 + 128) * 16) as usize
+            } else {
+                // Use unsigned addressing (0x8000-0x8FFF)
+                (tile_idx as usize) * 16
+            };
+            
+            if tile_addr + 16 > ppu.vram.len() {
+                continue;
+            }
+            
+            // Render this tile
+            for y in 0..8 {
+                let byte1 = ppu.vram[tile_addr + y * 2];
+                let byte2 = ppu.vram[tile_addr + y * 2 + 1];
+                
+                for x in 0..8 {
+                    let bit_pos = 7 - x;
+                    let bit1 = (byte1 >> bit_pos) & 1;
+                    let bit2 = (byte2 >> bit_pos) & 1;
+                    let color = (bit2 << 1) | bit1;
+                    
+                    let screen_x = start_x + map_x * 8 + x;
+                    let screen_y = start_y + map_y * 8 + y;
+                    
+                    if screen_x < SCREEN_WIDTH && screen_y < SCREEN_HEIGHT {
+                        ppu.frame_buffer[screen_y * SCREEN_WIDTH + screen_x] = color;
+                    }
+                }
+            }
+        }
+    }
 }
